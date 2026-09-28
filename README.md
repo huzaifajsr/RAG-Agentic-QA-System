@@ -88,7 +88,7 @@ RAG-Agentic-QA-System/
 ### Option 1: Local Setup
 ```bash
 # Clone
-git clone https://github.com/yourusername/RAG-Agentic-QA-System.git
+git clone https://github.com/huzaifajsr/RAG-Agentic-QA-System.git
 cd RAG-Agentic-QA-System
 
 # Backend
