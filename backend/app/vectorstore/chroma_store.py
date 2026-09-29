@@ -2,128 +2,124 @@
 
 import hashlib
 import logging
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional
+
 import chromadb
-from app.ingestion.embedder import EmbeddingService
+from chromadb.errors import NotFoundError
 
 logger = logging.getLogger(__name__)
 
+
+class CollectionNotFoundError(Exception):
+    """Raised when a named collection does not exist."""
+
+
 class ChromaStore:
-    """Vector store using ChromaDB."""
+    """Vector store using ChromaDB.
 
-    def __init__(self, persist_dir: str, collection_name: str, embedding_service: EmbeddingService):
+    Collections are looked up by name on every call instead of caching a single
+    collection handle, so deleting and re-creating a collection is safe and every
+    endpoint can work on any named collection.
+    """
+
+    def __init__(self, persist_dir: Optional[str], default_collection: str, embedding_service):
         """Initialize the ChromaDB store.
-        
-        Args:
-            persist_dir: Directory to persist ChromaDB data.
-            collection_name: Name of the collection.
-            embedding_service: Service to generate embeddings.
-        """
-        self.client = chromadb.PersistentClient(path=persist_dir)
-        self.collection_name = collection_name
-        self.embedding_service = embedding_service
-        self.collection = self.client.get_or_create_collection(name=collection_name)
 
-    def add_documents(self, chunks: List[Dict[str, Any]]) -> int:
-        """Add document chunks to the collection.
-        
         Args:
-            chunks: List of chunk dictionaries containing 'content' and 'metadata'.
-            
+            persist_dir: Directory to persist ChromaDB data (None = in-memory, for tests).
+            default_collection: Collection used when a call does not name one.
+            embedding_service: Object with embed_texts() and embed_query().
+        """
+        self.client = (
+            chromadb.PersistentClient(path=persist_dir)
+            if persist_dir
+            else chromadb.EphemeralClient()
+        )
+        self.default_collection = default_collection
+        self.embedding_service = embedding_service
+
+    # ------------------------------------------------------------------ helpers
+
+    def _name(self, collection_name: Optional[str]) -> str:
+        return collection_name or self.default_collection
+
+    def _get(self, collection_name: Optional[str]):
+        name = self._name(collection_name)
+        try:
+            return self.client.get_collection(name=name)
+        except (NotFoundError, ValueError) as e:
+            raise CollectionNotFoundError(name) from e
+
+    @staticmethod
+    def _chunk_id(chunk: Dict[str, Any]) -> str:
+        meta = chunk["metadata"]
+        key = f"{meta.get('source', '')}|{meta.get('page', '')}|{meta.get('chunk_index', 0)}|{chunk['content']}"
+        return hashlib.md5(key.encode("utf-8")).hexdigest()
+
+    # ------------------------------------------------------------------ public API
+
+    def add_documents(self, chunks: List[Dict[str, Any]], collection_name: Optional[str] = None) -> int:
+        """Add (or overwrite) document chunks in a collection, creating it if needed.
+
         Returns:
-            Count of added documents.
+            Number of chunks written.
         """
         if not chunks:
             return 0
-            
-        texts = [chunk["content"] for chunk in chunks]
-        metadatas = [chunk["metadata"] for chunk in chunks]
-        
-        try:
-            embeddings = self.embedding_service.embed_texts(texts)
-            
-            ids = []
-            for chunk in chunks:
-                content = chunk["content"]
-                source = chunk["metadata"].get("source", "")
-                chunk_index = chunk["metadata"].get("chunk_index", 0)
-                
-                unique_str = f"{content}{source}{chunk_index}"
-                doc_id = hashlib.md5(unique_str.encode("utf-8")).hexdigest()
-                ids.append(doc_id)
-            
-            self.collection.add(
-                embeddings=embeddings,
-                documents=texts,
-                metadatas=metadatas,
-                ids=ids
-            )
-            return len(chunks)
-        except Exception as e:
-            logger.error(f"Error adding documents to ChromaDB: {e}")
-            raise
+        collection = self.client.get_or_create_collection(name=self._name(collection_name))
+        texts = [c["content"] for c in chunks]
+        # upsert: re-uploading the same file replaces its chunks instead of
+        # silently skipping them as duplicate IDs.
+        collection.upsert(
+            ids=[self._chunk_id(c) for c in chunks],
+            embeddings=self.embedding_service.embed_texts(texts),
+            documents=texts,
+            metadatas=[c["metadata"] for c in chunks],
+        )
+        return len(chunks)
 
-    def search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        """Search for similar documents.
-        
-        Args:
-            query: The search query.
-            k: Number of results to return.
-            
-        Returns:
-            List of dictionaries with 'content', 'metadata', and 'score'.
+    def search(self, query: str, k: int = 5, collection_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Return up to k chunks most similar to the query.
+
+        Raises:
+            CollectionNotFoundError: if the collection does not exist.
         """
-        try:
-            query_embedding = self.embedding_service.embed_query(query)
-            
-            results = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=k,
-                include=["documents", "metadatas", "distances"]
-            )
-            
-            structured_results = []
-            if results["documents"] and results["documents"][0]:
-                for i in range(len(results["documents"][0])):
-                    distance = results["distances"][0][i] if results["distances"] else 0
-                    similarity_score = 1 / (1 + distance)
-                    
-                    structured_results.append({
-                        "content": results["documents"][0][i],
-                        "metadata": results["metadatas"][0][i] if results["metadatas"] else {},
-                        "score": similarity_score
-                    })
-            
-            return structured_results
-        except Exception as e:
-            logger.error(f"Error searching in ChromaDB: {e}")
-            raise
+        collection = self._get(collection_name)
+        count = collection.count()
+        if count == 0:
+            return []
 
-    def get_collection_info(self) -> Dict[str, Any]:
-        """Get information about the collection."""
-        try:
-            count = self.collection.count()
-            return {
-                "name": self.collection_name,
-                "count": count
-            }
-        except Exception as e:
-            logger.error(f"Error getting collection info: {e}")
-            raise
+        results = collection.query(
+            query_embeddings=[self.embedding_service.embed_query(query)],
+            n_results=min(k, count),
+            include=["documents", "metadatas", "distances"],
+        )
 
-    def delete_collection(self) -> None:
-        """Delete the collection."""
-        try:
-            self.client.delete_collection(self.collection_name)
-        except Exception as e:
-            logger.error(f"Error deleting collection {self.collection_name}: {e}")
-            raise
+        structured = []
+        docs = results["documents"][0] if results["documents"] else []
+        for i, content in enumerate(docs):
+            distance = results["distances"][0][i] if results["distances"] else 0.0
+            structured.append({
+                "content": content,
+                "metadata": (results["metadatas"][0][i] if results["metadatas"] else {}) or {},
+                # Maps distance (0 = identical) to a 0-1 score where higher is better.
+                "score": 1 / (1 + distance),
+            })
+        return structured
 
-    def list_collections(self) -> List[str]:
-        """List all collections."""
-        try:
-            collections = self.client.list_collections()
-            return [col.name for col in collections]
-        except Exception as e:
-            logger.error(f"Error listing collections: {e}")
-            raise
+    def get_collection_info(self, collection_name: Optional[str] = None) -> Dict[str, Any]:
+        collection = self._get(collection_name)
+        return {"name": collection.name, "count": collection.count()}
+
+    def list_collections(self) -> List[Dict[str, Any]]:
+        info = []
+        for col in self.client.list_collections():
+            # chromadb >= 0.6 returns Collection objects; older versions returned names.
+            name = col if isinstance(col, str) else col.name
+            info.append(self.get_collection_info(name))
+        return info
+
+    def delete_collection(self, collection_name: Optional[str] = None) -> None:
+        name = self._name(collection_name)
+        self._get(name)  # raises CollectionNotFoundError if missing
+        self.client.delete_collection(name=name)
